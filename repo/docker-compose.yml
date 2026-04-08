@@ -1,0 +1,109 @@
+services:
+  bootstrap:
+    image: alpine:3.19
+    volumes:
+      - ./scripts:/scripts:ro
+      - secrets:/run/secrets
+    command: ["/bin/sh", "/scripts/generate-secrets.sh"]
+    restart: "no"
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+    entrypoint: ["/bin/sh", "-c", ". /run/secrets/env && exec docker-entrypoint.sh postgres"]
+    environment:
+      POSTGRES_DB: fieldserve
+      POSTGRES_USER: fieldserve
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - secrets:/run/secrets:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fieldserve -d fieldserve"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c", ". /run/secrets/env && exec /bin/api"]
+    ports:
+      - "127.0.0.1:${API_PORT:-0}:8080"
+    environment:
+      PORT: "8080"
+    volumes:
+      - uploads:/app/data/uploads
+      - exports:/app/data/exports
+      - audit:/app/data/audit
+      - evidence:/app/data/evidence
+      - secrets:/run/secrets:ro
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.worker
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c", ". /run/secrets/env && exec /bin/worker"]
+    volumes:
+      - uploads:/app/data/uploads
+      - exports:/app/data/exports
+      - audit:/app/data/audit
+      - evidence:/app/data/evidence
+      - secrets:/run/secrets:ro
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    depends_on:
+      - api
+    ports:
+      - "127.0.0.1:${FRONTEND_PORT:-0}:80"
+
+  backend-test:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: builder
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c", ". /run/secrets/env && exec go test ./... -v -count=1"]
+    profiles:
+      - test
+    working_dir: /src
+    volumes:
+      - secrets:/run/secrets:ro
+
+  frontend-test:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      target: build
+    profiles:
+      - test
+    command: ["npm", "test", "--", "--run"]
+    working_dir: /app
+
+volumes:
+  pgdata:
+  secrets:
+  uploads:
+  exports:
+  audit:
+  evidence:
