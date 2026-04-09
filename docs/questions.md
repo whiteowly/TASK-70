@@ -1,71 +1,46 @@
-# Clarification Record
+## Business Logic Questions Log
 
-## Item 1: Local authentication bootstrap
+### 1. Clarification Defaults for Planning
+- Question: Can the drafted clarification defaults be used for planning?
+- My Understanding: The prompt was large enough that planning needed explicit confirmation that the clarification package was acceptable. We needed to lock this in rather than carrying uncertainty forward into the planning phase.
+- Solution: Yes. Proceed with the drafted defaults, allowing planning to start from the approved clarification brief instead of an uncertain baseline.
 
-### What was unclear
-The prompt requires RBAC for Administrators, Service Providers, and Customers in a fully offline system, but it does not specify how first-run access is bootstrapped.
+### 2. Offline Deployment Style
+- Question: What offline deployment style should the initial build assume?
+- My Understanding: The prompt required a fully offline system but did not force or prescribe a specific local deployment mechanism.
+- Solution: Use Docker Compose as the default offline deployment path. The project runtime contract will use docker compose up --build as the primary launch command.
 
-### Interpretation
-The product still needs a practical local-first auth flow that works without external identity providers.
+### 3. Excel Support Handling
+- Question: How should Excel support be handled in the first implementation pass?
+- My Understanding: The prompt required CSV/Excel support but did not specify whether legacy .xls format support was necessary alongside modern formats.
+- Solution: Support .xlsx plus CSV, and do not include legacy .xls in the first pass. Import/export planning and validation will target the newer .xlsx standard.
 
-### Decision
-Use local application-managed authentication with seeded development accounts for each role, plus a bootstrap path for the first administrator during local setup.
+### 4. Frontend Implementation Stack
+- Question: What specific technologies should be used for the frontend implementation?
+- My Understanding: The prompt already required a Vue workspace and a modern frontend framework. We need a default that keeps the implementation conventional and robust without changing the product scope.
+- Solution: Use Vue 3 + Vite + TypeScript + Vue Router + Pinia.
 
-### Why this is reasonable
-This preserves the offline requirement, supports role-based portals immediately, and avoids introducing external dependencies that contradict the prompt.
+### 5. Backend Implementation Stack
+- Question: What specific technologies should be used for the backend implementation?
+- My Understanding: The prompt already required FastAPI and PostgreSQL. We need to define the expected persistence, schema, and migration foundations based on those requirements.
+- Solution: Use FastAPI + SQLAlchemy + Alembic + Pydantic.
 
-## Item 2: Search latency target scope
+### 6. Offline Sync Package Shape
+- Question: How should the file structure for the offline sync package be defined?
+- My Understanding: The prompt required an offline sync package for cross-device transfer but did not define the specific file structure or mechanism for this package.
+- Solution: Use a versioned portable archive containing manifest metadata, serialized payloads, checksums, and referenced assets.
 
-### What was unclear
-The prompt requires paginated results that respond within 300 ms for cached queries, but it does not define where that budget is measured.
+### 7. HTTPS Setup Approach
+- Question: How should HTTPS be handled for a local-network offline environment?
+- My Understanding: The prompt required local-network HTTPS, so we need a practical, offline-safe way to satisfy this requirement without relying on external, internet-dependent certificate authorities.
+- Solution: Use a locally generated certificate workflow and explicitly document the trust/setup steps for the end user.
 
-### Interpretation
-The meaningful target is backend API response time for warm cached search requests under normal local usage, with the UI designed to avoid unnecessary query churn.
+### 8. Non-Image Resource Preview Behavior
+- Question: How should resource previews be handled for non-image files?
+- My Understanding: The prompt required thumbnail previews and controlled media handling, but non-image assets inherently need a different presentation strategy than standard image files.
+- Solution: Use document preview/file cards for non-image assets, while preserving stronger thumbnail behavior where applicable for images.
 
-### Decision
-Treat the 300 ms target as a warm-cache API performance requirement for repeated search requests against the local dataset, with caching, indexes, and debounced client querying supporting it.
-
-### Why this is reasonable
-It maps the requirement to a measurable engineering target without weakening the prompt and fits the stated local caching design.
-
-## Item 3: Trending recommendation logic
-
-### What was unclear
-The prompt asks for trending recommendations based on locally aggregated activity but does not define the scoring model.
-
-### Interpretation
-Recommendations should be derived from weighted local engagement signals rather than hard-coded sample data.
-
-### Decision
-Use locally aggregated events such as searches, favorites, profile views, and submitted interests with time-window weighting to produce trending recommendations.
-
-### Why this is reasonable
-This stays faithful to the offline and local-aggregation requirements while giving the feature a concrete, reviewable implementation target.
-
-## Item 4: Offline alert delivery channels
-
-### What was unclear
-The Alert Center includes escalation to on-call roles inside the app, but the prompt does not mention email, SMS, or external delivery channels.
-
-### Interpretation
-Alerting must remain fully in-app and local.
-
-### Decision
-Implement alert generation, escalation queues, acknowledgements, SLA timers, and work-order tracking entirely within the application, without external notification services.
-
-### Why this is reasonable
-It preserves the offline boundary and directly matches the prompt wording that escalation happens inside the app.
-
-## Item 5: Immutable audit log representation
-
-### What was unclear
-The prompt requires immutable append-only storage with daily rotation, but it does not prescribe the concrete local storage format.
-
-### Interpretation
-The log system must make writes append-only, rotate daily, and remain reviewable locally.
-
-### Decision
-Use append-only locally stored audit log files with daily rotation, with application write paths restricted to append semantics and audit events also indexed in relational storage where needed for UI review.
-
-### Why this is reasonable
-This satisfies immutability and rotation requirements while still supporting the admin review surfaces described in the prompt.
+### 9. Reserved Outbound Connectors
+- Question: How should SMS, email, and push notifications be implemented in an offline-first system?
+- My Understanding: The prompt explicitly stated that these connectors should be reserved for future use, but they are not required for core offline operations.
+- Solution: Keep SMS, email, and push as provider abstraction points, implementing them as disabled placeholders in v1.
