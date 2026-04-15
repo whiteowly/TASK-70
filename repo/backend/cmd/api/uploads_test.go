@@ -402,6 +402,305 @@ func TestDisallowedExtension(t *testing.T) {
 	}
 }
 
+// ---------- Admin analytics rollups & exports list/get/download coverage ----------
+
+// TestAdminAnalyticsRollup covers POST /api/v1/admin/analytics/rollup.
+// It seeds an interest so there is something to roll up and asserts the
+// rollup row appears in analytics_daily_rollups for today.
+func TestAdminAnalyticsRollup(t *testing.T) {
+	db := getTestDB(t)
+	cleanupUploadsData(t, db)
+	// Also clean engagement-related rows so seed counts are predictable
+	_, _ = db.Exec("DELETE FROM message_receipts")
+	_, _ = db.Exec("DELETE FROM messages")
+	_, _ = db.Exec("DELETE FROM interest_status_events")
+	_, _ = db.Exec("DELETE FROM interests")
+	_, _ = db.Exec("DELETE FROM service_availability_windows")
+	_, _ = db.Exec("DELETE FROM service_tags")
+	_, _ = db.Exec("DELETE FROM services")
+	_, _ = db.Exec("DELETE FROM categories")
+	_, _ = db.Exec("DELETE FROM search_events")
+
+	e := newServer(db)
+	adminCookie := loginAs(t, e, "admin", "admin123")
+	cat := adminCreateCategory(t, e, adminCookie, "RollupCat", "rollup-cat")
+
+	providerCookie := loginAs(t, e, "provider", "provider123")
+	svc := providerCreateService(t, e, providerCookie, cat["id"].(string), nil, "Rollup Svc")
+	svcID := svc["id"].(string)
+	providerProfileID := svc["provider"].(map[string]interface{})["id"].(string)
+
+	customerCookie := loginAs(t, e, "customer", "customer123")
+	body := fmt.Sprintf(`{"service_id":%q,"provider_id":%q}`, svcID, providerProfileID)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/customer/interests", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(customerCookie)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("submit interest: %d %s", rec.Code, rec.Body.String())
+	}
+
+	today := time.Now().Format("2006-01-02")
+	rollupBody := fmt.Sprintf(`{"from":%q,"to":%q}`, today, today)
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/admin/analytics/rollup", strings.NewReader(rollupBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(adminCookie)
+	rec = httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d; body: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp map[string]interface{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp["message"] == nil || resp["message"] == "" {
+		t.Fatal("expected non-empty message")
+	}
+	count, ok := resp["rollup_count"].(float64)
+	if !ok {
+		t.Fatalf("expected numeric rollup_count, got %T %v", resp["rollup_count"], resp["rollup_count"])
+	}
+	if int(count) < 1 {
+		t.Fatalf("expected at least 1 rollup, got %d", int(count))
+	}
+
+	// Verify a row is actually in the rollups table for today
+	var rowCount int
+	db.QueryRow(`SELECT COUNT(*) FROM analytics_daily_rollups WHERE rollup_date = $1`, today).Scan(&rowCount)
+	if rowCount < 1 {
+		t.Fatalf("expected >=1 rollup row in DB for %s, got %d", today, rowCount)
+	}
+}
+
+// TestAdminAnalyticsRollupAsCustomerForbidden verifies role enforcement on
+// POST /admin/analytics/rollup.
+func TestAdminAnalyticsRollupAsCustomerForbidden(t *testing.T) {
+	db := getTestDB(t)
+	cleanupUploadsData(t, db)
+	e := newServer(db)
+
+	customerCookie := loginAs(t, e, "customer", "customer123")
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/analytics/rollup", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(customerCookie)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d; body: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestAdminListExports covers GET /api/v1/admin/exports and asserts the most
+// recently created export is present with completed status.
+func TestAdminListExports(t *testing.T) {
+	db := getTestDB(t)
+	cleanupUploadsData(t, db)
+	e := newServer(db)
+
+	adminCookie := loginAs(t, e, "admin", "admin123")
+
+	// Create a fresh export
+	body := `{"export_type":"user_growth","from":"2020-01-01","to":"2030-12-31"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/exports", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(adminCookie)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("seed export: %d %s", rec.Code, rec.Body.String())
+	}
+	var createResp map[string]interface{}
+	json.Unmarshal(rec.Body.Bytes(), &createResp)
+	createdID := createResp["export"].(map[string]interface{})["id"].(string)
+
+	// GET /admin/exports
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/admin/exports", nil)
+	req.AddCookie(adminCookie)
+	rec = httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d; body: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp map[string]interface{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	exports := resp["exports"].([]interface{})
+	if len(exports) < 1 {
+		t.Fatal("expected at least 1 export")
+	}
+
+	found := false
+	for _, raw := range exports {
+		obj := raw.(map[string]interface{})
+		if obj["id"] == createdID {
+			found = true
+			if obj["status"] != "completed" {
+				t.Fatalf("expected status completed, got %v", obj["status"])
+			}
+			if obj["export_type"] != "user_growth" {
+				t.Fatalf("expected export_type user_growth, got %v", obj["export_type"])
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("created export %s not present in list", createdID)
+	}
+}
+
+// TestAdminGetExportSuccessAndNotFound covers GET /api/v1/admin/exports/:exportId.
+func TestAdminGetExportSuccessAndNotFound(t *testing.T) {
+	db := getTestDB(t)
+	cleanupUploadsData(t, db)
+	e := newServer(db)
+
+	adminCookie := loginAs(t, e, "admin", "admin123")
+
+	// Create
+	body := `{"export_type":"conversion","from":"2020-01-01","to":"2030-12-31"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/exports", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(adminCookie)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("seed export: %d %s", rec.Code, rec.Body.String())
+	}
+	var createResp map[string]interface{}
+	json.Unmarshal(rec.Body.Bytes(), &createResp)
+	exportID := createResp["export"].(map[string]interface{})["id"].(string)
+
+	// GET success
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/admin/exports/"+exportID, nil)
+	req.AddCookie(adminCookie)
+	rec = httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d; body: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp map[string]interface{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	export := resp["export"].(map[string]interface{})
+	if export["id"] != exportID {
+		t.Fatalf("expected id %s, got %v", exportID, export["id"])
+	}
+	if export["status"] != "completed" {
+		t.Fatalf("expected status completed, got %v", export["status"])
+	}
+	if export["export_type"] != "conversion" {
+		t.Fatalf("expected export_type conversion, got %v", export["export_type"])
+	}
+	if export["file_path"] == nil || export["file_path"] == "" {
+		t.Fatal("expected non-empty file_path on completed export")
+	}
+
+	// GET 404 for unknown id
+	missingID := "00000000-0000-0000-0000-0000000000ff"
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/admin/exports/"+missingID, nil)
+	req.AddCookie(adminCookie)
+	rec = httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d; body: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestAdminDownloadExport covers GET /api/v1/admin/exports/:exportId/download.
+// It asserts headers/content type and a non-empty body containing the CSV
+// header row produced by the analytics service.
+func TestAdminDownloadExport(t *testing.T) {
+	db := getTestDB(t)
+	cleanupUploadsData(t, db)
+	e := newServer(db)
+
+	adminCookie := loginAs(t, e, "admin", "admin123")
+	body := `{"export_type":"provider_utilization","from":"2020-01-01","to":"2030-12-31"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/exports", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(adminCookie)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("seed export: %d %s", rec.Code, rec.Body.String())
+	}
+	var createResp map[string]interface{}
+	json.Unmarshal(rec.Body.Bytes(), &createResp)
+	exportID := createResp["export"].(map[string]interface{})["id"].(string)
+
+	// Download
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/admin/exports/"+exportID+"/download", nil)
+	req.AddCookie(adminCookie)
+	rec = httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d; body: %s", rec.Code, rec.Body.String())
+	}
+
+	if rec.Body.Len() == 0 {
+		t.Fatal("expected non-empty download body")
+	}
+
+	contentType := rec.Header().Get("Content-Type")
+	if contentType == "" {
+		t.Fatal("expected Content-Type header to be set on download")
+	}
+
+	// CSV content for provider_utilization starts with the column header row.
+	bodyStr := rec.Body.String()
+	if !strings.Contains(bodyStr, "id,business_name,active_services,total_interests,messages_sent") {
+		t.Fatalf("expected CSV header row in downloaded body, got first 200 chars: %q",
+			bodyStr[:min(len(bodyStr), 200)])
+	}
+}
+
+// TestAdminDownloadExportNotFound covers the not-found path on download.
+//
+
+func TestAdminDownloadExportNotFound(t *testing.T) {
+	db := getTestDB(t)
+	cleanupUploadsData(t, db)
+	e := newServer(db)
+
+	adminCookie := loginAs(t, e, "admin", "admin123")
+	missingID := "00000000-0000-0000-0000-0000000000fe"
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/exports/"+missingID+"/download", nil)
+	req.AddCookie(adminCookie)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d; body: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestAdminListExportsAsCustomerForbidden verifies role enforcement.
+func TestAdminListExportsAsCustomerForbidden(t *testing.T) {
+	db := getTestDB(t)
+	cleanupUploadsData(t, db)
+	e := newServer(db)
+
+	customerCookie := loginAs(t, e, "customer", "customer123")
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/exports", nil)
+	req.AddCookie(customerCookie)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d; body: %s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestStoragePathConfinement(t *testing.T) {
 	// This test proves that user-controlled filenames cannot escape the uploads root.
 	// The upload handler uses uuid-based filenames and verifies the resolved absolute

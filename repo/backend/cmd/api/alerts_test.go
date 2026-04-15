@@ -9,6 +9,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -688,6 +689,546 @@ func TestEvidenceRejectedExtension(t *testing.T) {
 
 	if rec.Code != http.StatusUnsupportedMediaType {
 		t.Fatalf("expected 415 for .exe evidence, got %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// ---------- On-call, alert detail, work-order detail/evidence, checksum ----------
+
+// TestAdminCreateOnCallSuccess covers POST /api/v1/admin/on-call. It assigns
+// the seeded admin user to tier 1 for a 24-hour window and asserts the
+// returned schedule fields and DB persistence.
+func TestAdminCreateOnCallSuccess(t *testing.T) {
+	db := getTestDB(t)
+	cleanupAlertData(t, db)
+	e := newServer(db)
+
+	adminCookie := loginAs(t, e, "admin", "admin123")
+
+	var adminUserID string
+	if err := db.QueryRow(`SELECT id FROM users WHERE username = 'admin'`).Scan(&adminUserID); err != nil {
+		t.Fatalf("get admin: %v", err)
+	}
+
+	start := time.Now().UTC().Add(-time.Hour).Format(time.RFC3339)
+	end := time.Now().UTC().Add(24 * time.Hour).Format(time.RFC3339)
+	body := fmt.Sprintf(`{"user_id":%q,"tier":1,"start_time":%q,"end_time":%q}`, adminUserID, start, end)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/on-call", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(adminCookie)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d; body: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp map[string]interface{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	oc := resp["on_call_schedule"].(map[string]interface{})
+	if oc["user_id"] != adminUserID {
+		t.Fatalf("expected user_id %s, got %v", adminUserID, oc["user_id"])
+	}
+	if int(oc["tier"].(float64)) != 1 {
+		t.Fatalf("expected tier=1, got %v", oc["tier"])
+	}
+	if oc["id"] == nil || oc["id"] == "" {
+		t.Fatal("expected non-empty id")
+	}
+
+	var dbCount int
+	db.QueryRow(`SELECT COUNT(*) FROM on_call_schedules WHERE id = $1`, oc["id"]).Scan(&dbCount)
+	if dbCount != 1 {
+		t.Fatalf("expected 1 schedule row, got %d", dbCount)
+	}
+}
+
+// TestAdminCreateOnCallNonAdminAssigneeRejected verifies the assignee must
+// have administrator role.
+func TestAdminCreateOnCallNonAdminAssigneeRejected(t *testing.T) {
+	db := getTestDB(t)
+	cleanupAlertData(t, db)
+	e := newServer(db)
+
+	adminCookie := loginAs(t, e, "admin", "admin123")
+
+	var customerUserID string
+	if err := db.QueryRow(`SELECT id FROM users WHERE username = 'customer'`).Scan(&customerUserID); err != nil {
+		t.Fatalf("get customer: %v", err)
+	}
+
+	start := time.Now().UTC().Format(time.RFC3339)
+	end := time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
+	body := fmt.Sprintf(`{"user_id":%q,"tier":1,"start_time":%q,"end_time":%q}`, customerUserID, start, end)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/on-call", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(adminCookie)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422, got %d; body: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp map[string]interface{}
+	json.Unmarshal(rec.Body.Bytes(), &resp)
+	errObj := resp["error"].(map[string]interface{})
+	fieldErrors := errObj["field_errors"].(map[string]interface{})
+	if _, ok := fieldErrors["user_id"]; !ok {
+		t.Fatalf("expected user_id field error, got %v", fieldErrors)
+	}
+}
+
+// TestAdminCreateOnCallValidation verifies missing required fields → 422.
+func TestAdminCreateOnCallValidation(t *testing.T) {
+	db := getTestDB(t)
+	cleanupAlertData(t, db)
+	e := newServer(db)
+
+	adminCookie := loginAs(t, e, "admin", "admin123")
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/on-call", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(adminCookie)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422, got %d; body: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp map[string]interface{}
+	json.Unmarshal(rec.Body.Bytes(), &resp)
+	errObj := resp["error"].(map[string]interface{})
+	fieldErrors := errObj["field_errors"].(map[string]interface{})
+	for _, key := range []string{"user_id", "tier", "start_time", "end_time"} {
+		if _, ok := fieldErrors[key]; !ok {
+			t.Fatalf("expected field error for %s, got %v", key, fieldErrors)
+		}
+	}
+}
+
+// TestAdminGetAlertSuccessAndNotFound covers GET /api/v1/admin/alerts/:alertId.
+// Seeds a rule + alert + assignment and asserts the response includes both
+// the alert object and its assignments list.
+func TestAdminGetAlertSuccessAndNotFound(t *testing.T) {
+	db := getTestDB(t)
+	cleanupAlertData(t, db)
+	e := newServer(db)
+
+	adminCookie := loginAs(t, e, "admin", "admin123")
+
+	var adminUserID string
+	db.QueryRow(`SELECT id FROM users WHERE username = 'admin'`).Scan(&adminUserID)
+	ensureAdminOnCall(t, db)
+
+	ruleID := uuid.New().String()
+	cond, _ := json.Marshal(map[string]interface{}{"metric": "test"})
+	if _, err := db.Exec(
+		`INSERT INTO alert_rules (id, name, condition, severity, enabled, created_at, updated_at)
+		 VALUES ($1, 'AlertGet rule', $2, 'high', true, NOW(), NOW())`,
+		ruleID, cond); err != nil {
+		t.Fatalf("seed rule: %v", err)
+	}
+
+	alertID := uuid.New().String()
+	data, _ := json.Marshal(map[string]interface{}{"info": "ping"})
+	if _, err := db.Exec(
+		`INSERT INTO alerts (id, rule_id, severity, status, data, created_at)
+		 VALUES ($1, $2, 'high', 'new', $3, NOW())`,
+		alertID, ruleID, data); err != nil {
+		t.Fatalf("seed alert: %v", err)
+	}
+
+	// Assign so the response includes a non-empty assignments list
+	assignBody := fmt.Sprintf(`{"assignee_id":"%s"}`, adminUserID)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/alerts/"+alertID+"/assign", strings.NewReader(assignBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(adminCookie)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("seed assign: %d %s", rec.Code, rec.Body.String())
+	}
+
+	// GET success
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/admin/alerts/"+alertID, nil)
+	req.AddCookie(adminCookie)
+	rec = httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d; body: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp map[string]interface{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	alert := resp["alert"].(map[string]interface{})
+	if alert["id"] != alertID {
+		t.Fatalf("expected alert id %s, got %v", alertID, alert["id"])
+	}
+	if alert["severity"] != "high" {
+		t.Fatalf("expected severity high, got %v", alert["severity"])
+	}
+	if alert["rule_name"] != "AlertGet rule" {
+		t.Fatalf("expected rule_name 'AlertGet rule', got %v", alert["rule_name"])
+	}
+
+	assignments := resp["assignments"].([]interface{})
+	if len(assignments) != 1 {
+		t.Fatalf("expected 1 assignment, got %d", len(assignments))
+	}
+	asgn := assignments[0].(map[string]interface{})
+	if asgn["assignee_id"] != adminUserID {
+		t.Fatalf("expected assignee_id %s, got %v", adminUserID, asgn["assignee_id"])
+	}
+
+	// 404 for unknown alert
+	missingID := "00000000-0000-0000-0000-000000000aaa"
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/admin/alerts/"+missingID, nil)
+	req.AddCookie(adminCookie)
+	rec = httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d; body: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestAdminGetAlertAsCustomerForbidden verifies role enforcement.
+func TestAdminGetAlertAsCustomerForbidden(t *testing.T) {
+	db := getTestDB(t)
+	cleanupAlertData(t, db)
+	e := newServer(db)
+
+	customerCookie := loginAs(t, e, "customer", "customer123")
+	req := httptest.NewRequest(http.MethodGet,
+		"/api/v1/admin/alerts/00000000-0000-0000-0000-000000000123", nil)
+	req.AddCookie(customerCookie)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d; body: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestAdminGetWorkOrderSuccessAndNotFound covers GET /admin/work-orders/:id.
+func TestAdminGetWorkOrderSuccessAndNotFound(t *testing.T) {
+	db := getTestDB(t)
+	cleanupAlertData(t, db)
+	e := newServer(db)
+
+	adminCookie := loginAs(t, e, "admin", "admin123")
+
+	// Create work order
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/work-orders", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(adminCookie)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create wo: %d %s", rec.Code, rec.Body.String())
+	}
+	var createResp map[string]interface{}
+	json.Unmarshal(rec.Body.Bytes(), &createResp)
+	woID := createResp["work_order"].(map[string]interface{})["id"].(string)
+
+	// Dispatch to add another event
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/admin/work-orders/"+woID+"/dispatch", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(adminCookie)
+	rec = httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("dispatch: %d %s", rec.Code, rec.Body.String())
+	}
+
+	// GET success
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/admin/work-orders/"+woID, nil)
+	req.AddCookie(adminCookie)
+	rec = httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d; body: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp map[string]interface{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	wo := resp["work_order"].(map[string]interface{})
+	if wo["id"] != woID {
+		t.Fatalf("expected wo id %s, got %v", woID, wo["id"])
+	}
+	if wo["status"] != "dispatched" {
+		t.Fatalf("expected status dispatched, got %v", wo["status"])
+	}
+
+	events := resp["events"].([]interface{})
+	if len(events) != 2 {
+		t.Fatalf("expected 2 events (creation + dispatch), got %d", len(events))
+	}
+	if events[0].(map[string]interface{})["new_status"] != "new" {
+		t.Fatalf("expected first event new_status=new, got %v", events[0].(map[string]interface{})["new_status"])
+	}
+	if events[1].(map[string]interface{})["new_status"] != "dispatched" {
+		t.Fatalf("expected second event new_status=dispatched, got %v", events[1].(map[string]interface{})["new_status"])
+	}
+
+	// evidence list should be present (empty array)
+	if _, ok := resp["evidence"].([]interface{}); !ok {
+		t.Fatalf("expected evidence array on detail response, got %T", resp["evidence"])
+	}
+
+	// 404 for unknown work order
+	missingID := "00000000-0000-0000-0000-0000000000d0"
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/admin/work-orders/"+missingID, nil)
+	req.AddCookie(adminCookie)
+	rec = httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d; body: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestAdminGetWorkOrderAsCustomerForbidden verifies role enforcement.
+func TestAdminGetWorkOrderAsCustomerForbidden(t *testing.T) {
+	db := getTestDB(t)
+	cleanupAlertData(t, db)
+	e := newServer(db)
+
+	customerCookie := loginAs(t, e, "customer", "customer123")
+	req := httptest.NewRequest(http.MethodGet,
+		"/api/v1/admin/work-orders/00000000-0000-0000-0000-000000000123", nil)
+	req.AddCookie(customerCookie)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d; body: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestAdminListWorkOrderEvidence covers GET /admin/work-orders/:id/evidence.
+func TestAdminListWorkOrderEvidence(t *testing.T) {
+	db := getTestDB(t)
+	cleanupAlertData(t, db)
+	e := newServer(db)
+
+	adminCookie := loginAs(t, e, "admin", "admin123")
+
+	// Create work order
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/work-orders", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(adminCookie)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create wo: %d %s", rec.Code, rec.Body.String())
+	}
+	var createResp map[string]interface{}
+	json.Unmarshal(rec.Body.Bytes(), &createResp)
+	woID := createResp["work_order"].(map[string]interface{})["id"].(string)
+
+	// Empty evidence first
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/admin/work-orders/"+woID+"/evidence", nil)
+	req.AddCookie(adminCookie)
+	rec = httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d; body: %s", rec.Code, rec.Body.String())
+	}
+	var emptyResp map[string]interface{}
+	json.Unmarshal(rec.Body.Bytes(), &emptyResp)
+	emptyList := emptyResp["evidence"].([]interface{})
+	if len(emptyList) != 0 {
+		t.Fatalf("expected empty evidence list, got %d items", len(emptyList))
+	}
+
+	// Upload one piece of evidence
+	pdfContent := []byte("%PDF-1.0 evidence list test")
+	body := new(bytes.Buffer)
+	writer := multipart.NewWriter(body)
+	part, err := writer.CreateFormFile("file", "list.pdf")
+	if err != nil {
+		t.Fatalf("create form file: %v", err)
+	}
+	part.Write(pdfContent)
+	writer.Close()
+
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/admin/work-orders/"+woID+"/evidence", body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.AddCookie(adminCookie)
+	rec = httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("upload evidence: %d %s", rec.Code, rec.Body.String())
+	}
+	var upResp map[string]interface{}
+	json.Unmarshal(rec.Body.Bytes(), &upResp)
+	evidenceID := upResp["evidence"].(map[string]interface{})["id"].(string)
+
+	// List again
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/admin/work-orders/"+woID+"/evidence", nil)
+	req.AddCookie(adminCookie)
+	rec = httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d; body: %s", rec.Code, rec.Body.String())
+	}
+	var listResp map[string]interface{}
+	json.Unmarshal(rec.Body.Bytes(), &listResp)
+	evidence := listResp["evidence"].([]interface{})
+	if len(evidence) != 1 {
+		t.Fatalf("expected 1 evidence item, got %d", len(evidence))
+	}
+	ev := evidence[0].(map[string]interface{})
+	if ev["id"] != evidenceID {
+		t.Fatalf("expected id %s, got %v", evidenceID, ev["id"])
+	}
+	if ev["work_order_id"] != woID {
+		t.Fatalf("expected work_order_id %s, got %v", woID, ev["work_order_id"])
+	}
+	if ev["checksum_sha256"] == nil || ev["checksum_sha256"] == "" {
+		t.Fatal("expected non-empty checksum on evidence")
+	}
+}
+
+// TestAdminListWorkOrderEvidenceAsCustomerForbidden verifies role enforcement.
+func TestAdminListWorkOrderEvidenceAsCustomerForbidden(t *testing.T) {
+	db := getTestDB(t)
+	cleanupAlertData(t, db)
+	e := newServer(db)
+
+	customerCookie := loginAs(t, e, "customer", "customer123")
+	req := httptest.NewRequest(http.MethodGet,
+		"/api/v1/admin/work-orders/00000000-0000-0000-0000-000000000123/evidence", nil)
+	req.AddCookie(customerCookie)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d; body: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestAdminVerifyEvidenceChecksumMatchAndMismatch covers
+// POST /api/v1/admin/evidence/:evidenceId/verify-checksum.
+// Uploads evidence (which records the SHA-256 checksum on disk), verifies a
+// successful match, then tampers with the file on disk and asserts a 409
+// checksum_mismatch is returned.
+func TestAdminVerifyEvidenceChecksumMatchAndMismatch(t *testing.T) {
+	db := getTestDB(t)
+	cleanupAlertData(t, db)
+	e := newServer(db)
+
+	adminCookie := loginAs(t, e, "admin", "admin123")
+
+	// Create work order
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/work-orders", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(adminCookie)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create wo: %d %s", rec.Code, rec.Body.String())
+	}
+	var createResp map[string]interface{}
+	json.Unmarshal(rec.Body.Bytes(), &createResp)
+	woID := createResp["work_order"].(map[string]interface{})["id"].(string)
+
+	// Upload evidence
+	body := new(bytes.Buffer)
+	writer := multipart.NewWriter(body)
+	part, _ := writer.CreateFormFile("file", "checksum.pdf")
+	part.Write([]byte("%PDF-1.0 verify checksum test data"))
+	writer.Close()
+
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/admin/work-orders/"+woID+"/evidence", body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.AddCookie(adminCookie)
+	rec = httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("upload evidence: %d %s", rec.Code, rec.Body.String())
+	}
+	var upResp map[string]interface{}
+	json.Unmarshal(rec.Body.Bytes(), &upResp)
+	ev := upResp["evidence"].(map[string]interface{})
+	evidenceID := ev["id"].(string)
+	filePath := ev["file_path"].(string)
+
+	// Verify success
+	req = httptest.NewRequest(http.MethodPost,
+		"/api/v1/admin/evidence/"+evidenceID+"/verify-checksum", nil)
+	req.AddCookie(adminCookie)
+	rec = httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("verify success: expected 200, got %d; body: %s", rec.Code, rec.Body.String())
+	}
+	var verifyResp map[string]interface{}
+	json.Unmarshal(rec.Body.Bytes(), &verifyResp)
+	if verifyResp["status"] != "ok" {
+		t.Fatalf("expected status=ok, got %v", verifyResp["status"])
+	}
+	if verifyResp["message"] == nil || verifyResp["message"] == "" {
+		t.Fatal("expected non-empty message")
+	}
+
+	// Tamper with the file on disk → checksum mismatch
+	if err := os.WriteFile(filePath, []byte("tampered content not pdf"), 0644); err != nil {
+		t.Fatalf("tamper file: %v", err)
+	}
+
+	req = httptest.NewRequest(http.MethodPost,
+		"/api/v1/admin/evidence/"+evidenceID+"/verify-checksum", nil)
+	req.AddCookie(adminCookie)
+	rec = httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("verify mismatch: expected 409, got %d; body: %s", rec.Code, rec.Body.String())
+	}
+
+	var mismatchResp map[string]interface{}
+	json.Unmarshal(rec.Body.Bytes(), &mismatchResp)
+	errObj, ok := mismatchResp["error"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected error object, got %v", mismatchResp)
+	}
+	if errObj["code"] != "checksum_mismatch" {
+		t.Fatalf("expected code checksum_mismatch, got %v", errObj["code"])
+	}
+
+	// Verify the audit event was emitted
+	var auditCount int
+	db.QueryRow(
+		`SELECT COUNT(*) FROM audit_event_index WHERE event_type = 'evidence_checksum_mismatch' AND resource_id = $1`,
+		evidenceID,
+	).Scan(&auditCount)
+	if auditCount == 0 {
+		t.Fatal("expected evidence_checksum_mismatch audit event")
+	}
+}
+
+// TestAdminVerifyEvidenceChecksumAsProviderForbidden verifies role enforcement.
+func TestAdminVerifyEvidenceChecksumAsProviderForbidden(t *testing.T) {
+	db := getTestDB(t)
+	cleanupAlertData(t, db)
+	e := newServer(db)
+
+	providerCookie := loginAs(t, e, "provider", "provider123")
+	req := httptest.NewRequest(http.MethodPost,
+		"/api/v1/admin/evidence/00000000-0000-0000-0000-000000000aaa/verify-checksum", nil)
+	req.AddCookie(providerCookie)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d; body: %s", rec.Code, rec.Body.String())
 	}
 }
 

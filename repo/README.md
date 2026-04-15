@@ -1,5 +1,7 @@
 # FieldServe
 
+**Project type:** Fullstack web application (frontend + backend API + worker)
+
 Offline-first local service marketplace with role-based portals for Administrators, Service Providers, and Customers.
 
 ## Stack
@@ -19,6 +21,12 @@ docker compose up --build
 ```
 
 This is the primary runtime command. On first run a `bootstrap` init container generates ephemeral dev secrets into a Docker volume. No `.env` file is created anywhere in the repo tree. Secrets persist in the `secrets` volume across restarts and are cleared by `docker compose down -v`.
+
+If your environment still uses the legacy hyphenated CLI form, this equivalent command is also valid:
+
+```bash
+docker-compose up
+```
 
 Host ports are bound to `127.0.0.1` and assigned automatically by the OS to avoid collisions. After startup, discover the actual URLs:
 
@@ -511,6 +519,50 @@ This is the broad test command. It initializes the database, then runs:
 - **Frontend**: 72 Vitest tests (across 7 test files) — auth, routes, search, favorites, compare, distance sort, date-based availability filter, interests, messaging, blocking, uploads, analytics, exports, alert rules (create/edit), alert center (severity/on-call-select/assign/acknowledge), work order full lifecycle (dispatch through close), evidence upload, integration workflows
 
 No host toolchain beyond Docker is required.
+
+## Runtime verification
+
+After startup (`docker compose up --build` or `docker-compose up`) and DB initialization (`./init_db.sh`), verify the system with either API checks or UI flows.
+
+### API verification (curl)
+
+1. Discover runtime ports:
+
+```bash
+./scripts/show-urls.sh
+```
+
+2. Health check:
+
+```bash
+curl -i "http://127.0.0.1:<API_PORT>/api/v1/system/health"
+```
+
+Expected: `200 OK` with JSON containing `{"status":"ok"}`.
+
+3. Auth check (seeded admin credentials):
+
+```bash
+curl -i -X POST "http://127.0.0.1:<API_PORT>/api/v1/auth/login" \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"admin123"}'
+```
+
+Expected: `200 OK`, response includes user roles, and `Set-Cookie: fieldserve_session=...`.
+
+### UI verification (browser)
+
+1. Open frontend URL from `./scripts/show-urls.sh` (example: `http://127.0.0.1:<FRONTEND_PORT>`).
+2. Sign in as each seeded role:
+   - `admin` / `admin123` -> redirected to `/admin`
+   - `provider` / `provider123` -> redirected to `/provider`
+   - `customer` / `customer123` -> redirected to `/customer`
+3. Confirm role guards:
+   - Logged-in customer opening an `/admin` route should receive a forbidden experience (no admin data access).
+4. Confirm one write operation per role persists and reloads:
+   - Admin: create a category or tag
+   - Provider: create a service
+   - Customer: add then remove a favorite
 
 ## Secret management
 

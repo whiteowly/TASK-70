@@ -733,3 +733,418 @@ func TestFieldErrorRendering(t *testing.T) {
 		t.Fatalf("expected name field errors to be non-empty array, got %v", fieldErrors["name"])
 	}
 }
+
+// TestCatalogListTags verifies GET /api/v1/catalog/tags returns the public tag
+// catalog after admin creates tags via the admin API. Routed through the real
+// Echo router, no mocks.
+func TestCatalogListTags(t *testing.T) {
+	db := getTestDB(t)
+	cleanupCatalogData(t, db)
+	e := newServer(db)
+
+	adminCookie := loginAs(t, e, "admin", "admin123")
+	tag1 := adminCreateTag(t, e, adminCookie, "Emergency-CatList")
+	tag2 := adminCreateTag(t, e, adminCookie, "Weekend-CatList")
+
+	customerCookie := loginAs(t, e, "customer", "customer123")
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/catalog/tags", nil)
+	req.AddCookie(customerCookie)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d; body: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp map[string]interface{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	tags, ok := resp["tags"].([]interface{})
+	if !ok {
+		t.Fatalf("expected tags array, got %T", resp["tags"])
+	}
+	if len(tags) < 2 {
+		t.Fatalf("expected at least 2 tags, got %d", len(tags))
+	}
+
+	// Verify both created tags are present and that returned objects expose id+name
+	want := map[string]bool{tag1["id"].(string): false, tag2["id"].(string): false}
+	for _, raw := range tags {
+		obj := raw.(map[string]interface{})
+		if obj["id"] == nil || obj["id"] == "" {
+			t.Fatal("expected non-empty id on tag")
+		}
+		if obj["name"] == nil || obj["name"] == "" {
+			t.Fatal("expected non-empty name on tag")
+		}
+		if _, ok := want[obj["id"].(string)]; ok {
+			want[obj["id"].(string)] = true
+		}
+	}
+	for id, found := range want {
+		if !found {
+			t.Fatalf("created tag %s not present in catalog list", id)
+		}
+	}
+}
+
+// TestCatalogListTagsRequiresAuth verifies the public catalog tags endpoint
+// still requires an authenticated session (mounted under /catalog with
+// authSvc.RequireAuth()).
+func TestCatalogListTagsRequiresAuth(t *testing.T) {
+	db := getTestDB(t)
+	e := newServer(db)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/catalog/tags", nil)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for unauthenticated, got %d", rec.Code)
+	}
+}
+
+// TestAdminListCategories verifies GET /api/v1/admin/categories returns the
+// admin view of all categories with id/name/slug/sort_order fields.
+func TestAdminListCategories(t *testing.T) {
+	db := getTestDB(t)
+	cleanupCatalogData(t, db)
+	e := newServer(db)
+
+	adminCookie := loginAs(t, e, "admin", "admin123")
+	c1 := adminCreateCategory(t, e, adminCookie, "AdminListA", "admin-list-a")
+	c2 := adminCreateCategory(t, e, adminCookie, "AdminListB", "admin-list-b")
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/categories", nil)
+	req.AddCookie(adminCookie)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d; body: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp map[string]interface{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	cats, ok := resp["categories"].([]interface{})
+	if !ok {
+		t.Fatalf("expected categories array, got %T", resp["categories"])
+	}
+
+	ids := map[string]map[string]interface{}{}
+	for _, raw := range cats {
+		obj := raw.(map[string]interface{})
+		ids[obj["id"].(string)] = obj
+	}
+	got1, ok := ids[c1["id"].(string)]
+	if !ok {
+		t.Fatalf("expected created category %s in admin list", c1["id"])
+	}
+	if got1["slug"] != "admin-list-a" {
+		t.Fatalf("expected slug admin-list-a, got %v", got1["slug"])
+	}
+	if _, ok := ids[c2["id"].(string)]; !ok {
+		t.Fatalf("expected created category %s in admin list", c2["id"])
+	}
+}
+
+// TestAdminListCategoriesAsCustomerForbidden verifies role enforcement on
+// the admin list endpoint.
+func TestAdminListCategoriesAsCustomerForbidden(t *testing.T) {
+	db := getTestDB(t)
+	cleanupCatalogData(t, db)
+	e := newServer(db)
+
+	customerCookie := loginAs(t, e, "customer", "customer123")
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/categories", nil)
+	req.AddCookie(customerCookie)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d; body: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestAdminListTags verifies GET /api/v1/admin/tags returns all tags ordered
+// by name with id/name/created_at fields.
+func TestAdminListTags(t *testing.T) {
+	db := getTestDB(t)
+	cleanupCatalogData(t, db)
+	e := newServer(db)
+
+	adminCookie := loginAs(t, e, "admin", "admin123")
+	t1 := adminCreateTag(t, e, adminCookie, "Bravo-AdminList")
+	t2 := adminCreateTag(t, e, adminCookie, "Alpha-AdminList")
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/tags", nil)
+	req.AddCookie(adminCookie)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d; body: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp map[string]interface{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	tags := resp["tags"].([]interface{})
+
+	ids := map[string]map[string]interface{}{}
+	for _, raw := range tags {
+		obj := raw.(map[string]interface{})
+		ids[obj["id"].(string)] = obj
+	}
+	if _, ok := ids[t1["id"].(string)]; !ok {
+		t.Fatalf("expected tag %s in admin list", t1["id"])
+	}
+	if _, ok := ids[t2["id"].(string)]; !ok {
+		t.Fatalf("expected tag %s in admin list", t2["id"])
+	}
+}
+
+// TestAdminListTagsAsProviderForbidden verifies role enforcement.
+func TestAdminListTagsAsProviderForbidden(t *testing.T) {
+	db := getTestDB(t)
+	cleanupCatalogData(t, db)
+	e := newServer(db)
+
+	providerCookie := loginAs(t, e, "provider", "provider123")
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/tags", nil)
+	req.AddCookie(providerCookie)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d; body: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestAdminListHotKeywords verifies GET /api/v1/admin/search-config/hot-keywords
+// returns the full admin view (including is_hot=false rows that the public
+// /catalog/hot-keywords endpoint hides).
+func TestAdminListHotKeywords(t *testing.T) {
+	db := getTestDB(t)
+	cleanupSearchData(t, db)
+	e := newServer(db)
+
+	adminCookie := loginAs(t, e, "admin", "admin123")
+
+	// Create one hot and one not-hot keyword
+	for _, body := range []string{
+		`{"keyword":"hotword-admin","is_hot":true}`,
+		`{"keyword":"coldword-admin","is_hot":false}`,
+	} {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/search-config/hot-keywords", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.AddCookie(adminCookie)
+		rec := httptest.NewRecorder()
+		e.ServeHTTP(rec, req)
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("seed keyword failed: %d %s", rec.Code, rec.Body.String())
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/search-config/hot-keywords", nil)
+	req.AddCookie(adminCookie)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d; body: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp map[string]interface{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	keywords := resp["keywords"].([]interface{})
+
+	// Both rows must be present (admin sees the full config, not just hot)
+	seen := map[string]bool{}
+	for _, raw := range keywords {
+		obj := raw.(map[string]interface{})
+		seen[obj["keyword"].(string)] = obj["is_hot"].(bool)
+	}
+	if hot, ok := seen["hotword-admin"]; !ok || !hot {
+		t.Fatalf("expected hotword-admin with is_hot=true in admin list, seen=%v", seen)
+	}
+	if hot, ok := seen["coldword-admin"]; !ok || hot {
+		t.Fatalf("expected coldword-admin with is_hot=false in admin list, seen=%v", seen)
+	}
+}
+
+// TestAdminListHotKeywordsAsCustomerForbidden verifies role enforcement.
+func TestAdminListHotKeywordsAsCustomerForbidden(t *testing.T) {
+	db := getTestDB(t)
+	cleanupSearchData(t, db)
+	e := newServer(db)
+
+	customerCookie := loginAs(t, e, "customer", "customer123")
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/search-config/hot-keywords", nil)
+	req.AddCookie(customerCookie)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d; body: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestAdminListAutocompleteAndUpdate covers both
+//  - GET  /api/v1/admin/search-config/autocomplete
+//  - PATCH /api/v1/admin/search-config/autocomplete/:termId
+// It verifies admin sort order (weight DESC), update success, and that the
+// patched row is reflected in the list.
+func TestAdminListAutocompleteAndUpdate(t *testing.T) {
+	db := getTestDB(t)
+	cleanupSearchData(t, db)
+	e := newServer(db)
+
+	adminCookie := loginAs(t, e, "admin", "admin123")
+
+	// Seed two terms
+	createTerm := func(term string, weight int) string {
+		body := fmt.Sprintf(`{"term":%q,"weight":%d}`, term, weight)
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/search-config/autocomplete", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.AddCookie(adminCookie)
+		rec := httptest.NewRecorder()
+		e.ServeHTTP(rec, req)
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("seed term %s: %d %s", term, rec.Code, rec.Body.String())
+		}
+		var resp map[string]interface{}
+		json.Unmarshal(rec.Body.Bytes(), &resp)
+		return resp["term"].(map[string]interface{})["id"].(string)
+	}
+	lowID := createTerm("autocomplete-low", 1)
+	highID := createTerm("autocomplete-high", 99)
+
+	// List
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/search-config/autocomplete", nil)
+	req.AddCookie(adminCookie)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list expected 200, got %d; body: %s", rec.Code, rec.Body.String())
+	}
+
+	var listResp map[string]interface{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &listResp); err != nil {
+		t.Fatalf("decode list: %v", err)
+	}
+	terms := listResp["terms"].([]interface{})
+	if len(terms) < 2 {
+		t.Fatalf("expected >=2 terms, got %d", len(terms))
+	}
+	// Find positions and ensure higher-weight term comes before lower-weight
+	posHigh, posLow := -1, -1
+	for i, raw := range terms {
+		obj := raw.(map[string]interface{})
+		if obj["id"] == highID {
+			posHigh = i
+		}
+		if obj["id"] == lowID {
+			posLow = i
+		}
+	}
+	if posHigh < 0 || posLow < 0 {
+		t.Fatalf("expected both seeded terms in list, got positions high=%d low=%d", posHigh, posLow)
+	}
+	if posHigh >= posLow {
+		t.Fatalf("expected higher-weight term to sort earlier, got high=%d low=%d", posHigh, posLow)
+	}
+
+	// PATCH the low-weight term: bump weight and rename
+	patchBody := `{"term":"autocomplete-low-renamed","weight":150}`
+	req = httptest.NewRequest(http.MethodPatch, "/api/v1/admin/search-config/autocomplete/"+lowID, strings.NewReader(patchBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(adminCookie)
+	rec = httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("patch expected 200, got %d; body: %s", rec.Code, rec.Body.String())
+	}
+
+	var patchResp map[string]interface{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &patchResp); err != nil {
+		t.Fatalf("decode patch: %v", err)
+	}
+	updated := patchResp["term"].(map[string]interface{})
+	if updated["term"] != "autocomplete-low-renamed" {
+		t.Fatalf("expected renamed term, got %v", updated["term"])
+	}
+	if int(updated["weight"].(float64)) != 150 {
+		t.Fatalf("expected weight=150, got %v", updated["weight"])
+	}
+	if updated["id"] != lowID {
+		t.Fatalf("expected same id, got %v", updated["id"])
+	}
+}
+
+// TestAdminPatchAutocompleteNotFound verifies 404 on PATCH with unknown ID.
+func TestAdminPatchAutocompleteNotFound(t *testing.T) {
+	db := getTestDB(t)
+	cleanupSearchData(t, db)
+	e := newServer(db)
+
+	adminCookie := loginAs(t, e, "admin", "admin123")
+
+	// Use a syntactically valid UUID that doesn't exist
+	missingID := "00000000-0000-0000-0000-000000000099"
+	req := httptest.NewRequest(http.MethodPatch, "/api/v1/admin/search-config/autocomplete/"+missingID,
+		strings.NewReader(`{"term":"x"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(adminCookie)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d; body: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestAdminPatchAutocompleteAsCustomerForbidden verifies role enforcement.
+func TestAdminPatchAutocompleteAsCustomerForbidden(t *testing.T) {
+	db := getTestDB(t)
+	cleanupSearchData(t, db)
+	e := newServer(db)
+
+	customerCookie := loginAs(t, e, "customer", "customer123")
+	req := httptest.NewRequest(http.MethodPatch,
+		"/api/v1/admin/search-config/autocomplete/00000000-0000-0000-0000-000000000099",
+		strings.NewReader(`{"term":"x"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(customerCookie)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d; body: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestAdminListAutocompleteAsCustomerForbidden verifies role enforcement on
+// GET /admin/search-config/autocomplete.
+func TestAdminListAutocompleteAsCustomerForbidden(t *testing.T) {
+	db := getTestDB(t)
+	cleanupSearchData(t, db)
+	e := newServer(db)
+
+	customerCookie := loginAs(t, e, "customer", "customer123")
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/search-config/autocomplete", nil)
+	req.AddCookie(customerCookie)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d; body: %s", rec.Code, rec.Body.String())
+	}
+}
